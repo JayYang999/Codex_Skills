@@ -1,0 +1,477 @@
+#!/usr/bin/env python3
+"""Offline, stateful fake of the small lark-cli surface used by PRD evals."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import sys
+from typing import Any
+import xml.etree.ElementTree as ET
+
+
+SCENARIOS = {"happy", "conflict", "partial_middle", "permission_denied"}
+FORBIDDEN_COMMANDS = {
+    "create",
+    "overwrite",
+    "str_replace",
+    "block_replace",
+    "block_move_after",
+}
+INITIAL_CONTENT = (
+    '<document><paragraph block_id="intro"><text>existing document</text></paragraph>'
+    '<paragraph block_id="old_tail"><text>existing tail</text></paragraph></document>'
+)
+AUTH_FLAGS = {"--json", "--verify"}
+SCHEMA_FLAGS = {"--format"}
+PERMISSION_FLAGS = {"--as", "--token", "--type", "--action", "--format"}
+FETCH_FLAGS = {
+    "--as",
+    "--doc",
+    "--detail",
+    "--format",
+    "--scope",
+    "--start-block-id",
+    "--end-block-id",
+    "--max-depth",
+    "--context-before",
+    "--context-after",
+}
+UPDATE_FLAGS = {
+    "--as",
+    "--doc",
+    "--command",
+    "--doc-format",
+    "--revision-id",
+    "--content",
+}
+def emit(payload: dict[str, Any], exit_code: int = 0) -> int:
+    print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+    return exit_code
+
+
+def error(code: str, message: str, exit_code: int = 2, **details: Any) -> int:
+    return emit(
+        {"ok": False, "error": {"code": code, "message": message, **details}},
+        exit_code,
+    )
+
+
+def parse_flags(
+    argv: list[str],
+    prefix: tuple[str, ...],
+    value_flags: set[str],
+    required: set[str],
+    boolean_flags: set[str] | None = None,
+) -> tuple[dict[str, str | bool] | None, str | None]:
+    """Parse a command tail without accepting argparse-style conveniences."""
+    if tuple(argv[: len(prefix)]) != prefix:
+        return None, "unexpected command prefix"
+
+    booleans = boolean_flags or set()
+    allowed = value_flags | booleans
+    parsed: dict[str, str | bool] = {}
+    index = len(prefix)
+    while index < len(argv):
+        flag = argv[index]
+        if not flag.startswith("--"):
+            return None, "unexpected positional argument"
+        if "=" in flag or flag not in allowed:
+            return None, "unknown flag"
+        if flag in parsed:
+            return None, "duplicate flag"
+        if flag in booleans:
+            parsed[flag] = True
+            index += 1
+            continue
+        if index + 1 >= len(argv) or argv[index + 1].startswith("--"):
+            return None, "missing flag value"
+        value = argv[index + 1]
+        if value == "":
+            return None, "missing flag value"
+        parsed[flag] = value
+        index += 2
+
+    missing = required - parsed.keys()
+    if missing:
+        return None, "missing required flag"
+    return parsed, None
+
+
+def command_logging_shape(argv: list[str]) -> tuple[int, set[str], set[str]]:
+    shapes = (
+        (("auth", "status"), set(), AUTH_FLAGS),
+        (("schema", "drive.permission.members.auth"), SCHEMA_FLAGS, set()),
+        (("drive", "permission.members", "auth"), PERMISSION_FLAGS, set()),
+        (("docs", "+fetch"), FETCH_FLAGS, set()),
+        (("docs", "+update"), UPDATE_FLAGS, set()),
+        (("docs", "+create"), {"--doc"}, set()),
+    )
+    for prefix, values, booleans in shapes:
+        if tuple(argv[: len(prefix)]) == prefix:
+            return len(prefix), values, booleans
+    command_words = 1 if argv and not argv[0].startswith("--") else 0
+    return command_words, set(), set()
+
+
+def redacted_argv(argv: list[str]) -> list[str]:
+    """Keep command/flag structure while never logging sensitive or unknown values."""
+    prefix_length, known_value_flags, boolean_flags = command_logging_shape(argv)
+    result = list(argv[:prefix_length])
+    index = prefix_length
+    while index < len(argv):
+        item = argv[index]
+        if item.startswith("--"):
+            if "=" in item:
+                flag, _value = item.split("=", 1)
+                result.extend((flag, "<redacted>"))
+                index += 1
+                continue
+            result.append(item)
+            if item in boolean_flags:
+                index += 1
+                continue
+            if index + 1 < len(argv) and not argv[index + 1].startswith("--"):
+                result.append("<redacted>")
+                index += 2
+                continue
+            index += 1
+            continue
+        result.append("<redacted>")
+        index += 1
+    return result
+
+
+def first_flag_value(argv: list[str], name: str) -> str | None:
+    indexes = [index for index, item in enumerate(argv) if item == name]
+    if len(indexes) != 1 or indexes[0] + 1 >= len(argv):
+        return None
+    value = argv[indexes[0] + 1]
+    return None if value.startswith("--") else value
+
+
+def load_state(path: Path) -> dict[str, Any]:
+    if path.exists():
+        return json.loads(path.read_text(encoding="utf-8"))
+    return {
+        "revision_id": "21",
+        "content": INITIAL_CONTENT,
+        "call_counts": {
+            "auth": 0,
+            "schema": 0,
+            "permission": 0,
+            "fetch": 0,
+            "update": 0,
+            "rejected": 0,
+        },
+    }
+
+
+def save_state(path: Path, state: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(state, ensure_ascii=False, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+
+
+def append_log(path: Path, record: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+
+
+def corrupt_append(content: str) -> str:
+    content = re.sub(r"<h1>.*?</h1>\s*", "", content, count=1, flags=re.DOTALL)
+    return re.sub(
+        r'<whiteboard\s+type="mermaid">(.*?)</whiteboard>',
+        r"<p>\1</p>",
+        content,
+        flags=re.DOTALL,
+    )
+
+
+def append_to_document(content: str, fragment: str) -> str:
+    if not content.endswith("</document>"):
+        raise ValueError("stored document has no closing document tag")
+    ET.fromstring(f"<fragment>{fragment}</fragment>")
+    updated = content.removesuffix("</document>") + fragment + "</document>"
+    ET.fromstring(updated)
+    return updated
+
+
+def main() -> int:
+    argv = sys.argv[1:]
+    scenario = os.environ.get("MOCK_LARK_SCENARIO", "")
+    state_name = os.environ.get("MOCK_LARK_STATE")
+    log_name = os.environ.get("MOCK_LARK_LOG")
+
+    stdin_bytes = b""
+    is_update = argv[:2] == ["docs", "+update"]
+    if is_update:
+        stdin_bytes = sys.stdin.buffer.read()
+
+    record: dict[str, Any] = {
+        "argv": redacted_argv(argv),
+        "scenario": scenario if scenario in SCENARIOS else "<redacted>",
+    }
+    if is_update:
+        revision = first_flag_value(argv, "--revision-id")
+        command = first_flag_value(argv, "--command")
+        record.update(
+            {
+                "revision_id": revision if revision and revision.isdigit() else "<redacted>",
+                "command": command if command in FORBIDDEN_COMMANDS | {"append"} else "<redacted>",
+                "stdin_bytes": len(stdin_bytes),
+                "stdin_sha256": hashlib.sha256(stdin_bytes).hexdigest(),
+            }
+        )
+
+    if log_name:
+        append_log(Path(log_name), record)
+    if not state_name or not log_name or not scenario:
+        if state_name:
+            state_path = Path(state_name)
+            state = load_state(state_path)
+            state["call_counts"]["rejected"] += 1
+            save_state(state_path, state)
+        return error("missing_environment", "MOCK_LARK_SCENARIO, MOCK_LARK_STATE and MOCK_LARK_LOG are required")
+
+    state_path = Path(state_name)
+    state = load_state(state_path)
+
+    if scenario not in SCENARIOS:
+        state["call_counts"]["rejected"] += 1
+        save_state(state_path, state)
+        return error("invalid_scenario", "MOCK_LARK_SCENARIO must name a supported scenario")
+
+    if argv[:2] == ["auth", "status"]:
+        parsed, parse_error = parse_flags(
+            argv,
+            ("auth", "status"),
+            set(),
+            AUTH_FLAGS,
+            AUTH_FLAGS,
+        )
+        if parse_error:
+            state["call_counts"]["rejected"] += 1
+            save_state(state_path, state)
+            return error("invalid_arguments", parse_error)
+        state["call_counts"]["auth"] += 1
+        save_state(state_path, state)
+        return emit(
+            {
+                "ok": True,
+                "userName": "杨九阳",
+                "openId": "ou_yang",
+                "tokenStatus": "有效",
+                "verified": True,
+                "data": {
+                    "verified": True,
+                    "user": {"name": "杨九阳", "openId": "ou_yang"},
+                },
+            }
+        )
+
+    if argv[:2] == ["schema", "drive.permission.members.auth"]:
+        parsed, parse_error = parse_flags(
+            argv,
+            ("schema", "drive.permission.members.auth"),
+            SCHEMA_FLAGS,
+            SCHEMA_FLAGS,
+        )
+        if parse_error or parsed is None or parsed["--format"] != "json":
+            state["call_counts"]["rejected"] += 1
+            save_state(state_path, state)
+            return error("invalid_arguments", parse_error or "invalid flag value")
+        state["call_counts"].setdefault("schema", 0)
+        state["call_counts"]["schema"] += 1
+        save_state(state_path, state)
+        return emit(
+            {
+                "ok": True,
+                "data": {
+                    "method": "drive.permission.members.auth",
+                    "parameters": {
+                        "as": {"flag": "--as", "required": True, "enum": ["user"]},
+                        "token": {"flag": "--token", "required": True, "type": "string"},
+                        "type": {"flag": "--type", "required": True, "enum": ["docx"]},
+                        "action": {"flag": "--action", "required": True, "enum": ["edit"]},
+                        "format": {"flag": "--format", "required": True, "enum": ["json"]},
+                    },
+                },
+            }
+        )
+
+    if argv[:3] == ["drive", "permission.members", "auth"]:
+        parsed, parse_error = parse_flags(
+            argv,
+            ("drive", "permission.members", "auth"),
+            PERMISSION_FLAGS,
+            PERMISSION_FLAGS,
+        )
+        if parse_error or parsed is None or any(
+            parsed[name] != expected
+            for name, expected in {
+                "--as": "user",
+                "--type": "docx",
+                "--action": "edit",
+                "--format": "json",
+            }.items()
+        ):
+            state["call_counts"]["rejected"] += 1
+            save_state(state_path, state)
+            return error("invalid_arguments", parse_error or "invalid flag value")
+        state["call_counts"]["permission"] += 1
+        save_state(state_path, state)
+        return emit(
+            {
+                "ok": True,
+                "data": {"auth_result": scenario != "permission_denied"},
+            }
+        )
+
+    if argv[:2] == ["docs", "+fetch"]:
+        parsed, parse_error = parse_flags(
+            argv,
+            ("docs", "+fetch"),
+            FETCH_FLAGS,
+            {"--as", "--doc", "--detail", "--format"},
+        )
+        if parse_error or parsed is None or any(
+            parsed[name] != expected
+            for name, expected in {"--as": "user", "--detail": "full", "--format": "json"}.items()
+        ):
+            state["call_counts"]["rejected"] += 1
+            save_state(state_path, state)
+            return error("invalid_arguments", parse_error or "invalid flag value")
+        for numeric_flag in ("--max-depth", "--context-before", "--context-after"):
+            if numeric_flag in parsed and not re.fullmatch(r"[0-9]+", str(parsed[numeric_flag])):
+                state["call_counts"]["rejected"] += 1
+                save_state(state_path, state)
+                return error("invalid_arguments", f"{numeric_flag} must be a non-negative integer")
+        state["call_counts"]["fetch"] += 1
+        save_state(state_path, state)
+        return emit(
+            {
+                "ok": True,
+                "data": {
+                    "doc": parsed["--doc"],
+                    "revision_id": state["revision_id"],
+                    "content": state["content"],
+                },
+            }
+        )
+
+    if argv[:2] == ["docs", "+create"]:
+        state["call_counts"]["rejected"] += 1
+        save_state(state_path, state)
+        return error("forbidden_command", "create is forbidden in the offline harness")
+
+    if is_update:
+        state["call_counts"]["update"] += 1
+        parsed, parse_error = parse_flags(
+            argv,
+            ("docs", "+update"),
+            UPDATE_FLAGS,
+            UPDATE_FLAGS,
+        )
+        if parse_error or parsed is None:
+            state["call_counts"]["rejected"] += 1
+            save_state(state_path, state)
+            return error("invalid_arguments", parse_error or "invalid arguments")
+
+        command = str(parsed["--command"])
+        revision = str(parsed["--revision-id"])
+        if command in FORBIDDEN_COMMANDS:
+            state["call_counts"]["rejected"] += 1
+            save_state(state_path, state)
+            return error("forbidden_command", f"{command} is forbidden in the offline harness")
+        if command != "append":
+            state["call_counts"]["rejected"] += 1
+            save_state(state_path, state)
+            return error("invalid_command", "unsupported update command")
+        if any(
+            parsed[name] != expected
+            for name, expected in {
+                "--as": "user",
+                "--doc-format": "xml",
+                "--content": "-",
+            }.items()
+        ):
+            state["call_counts"]["rejected"] += 1
+            save_state(state_path, state)
+            return error("invalid_arguments", "invalid flag value")
+        if not stdin_bytes:
+            state["call_counts"]["rejected"] += 1
+            save_state(state_path, state)
+            return error("empty_content", "append content must not be empty")
+        if revision != state["revision_id"]:
+            state["call_counts"]["rejected"] += 1
+            save_state(state_path, state)
+            return error(
+                "revision_conflict",
+                "revision does not match current document",
+                current_revision_id=state["revision_id"],
+            )
+        if scenario == "permission_denied":
+            state["call_counts"]["rejected"] += 1
+            save_state(state_path, state)
+            return error("permission_denied", "document is not editable", exit_code=3)
+        if scenario == "conflict":
+            state["call_counts"]["rejected"] += 1
+            state["revision_id"] = str(int(state["revision_id"]) + 1)
+            state["content"] = append_to_document(
+                state["content"],
+                '<paragraph block_id="external_change"><text>external change</text></paragraph>',
+            )
+            save_state(state_path, state)
+            return error(
+                "revision_conflict",
+                "document changed externally",
+                exit_code=4,
+                current_revision_id=state["revision_id"],
+            )
+
+        try:
+            append_content = stdin_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            state["call_counts"]["rejected"] += 1
+            save_state(state_path, state)
+            return error("invalid_utf8", "append content must be valid UTF-8")
+        if scenario == "partial_middle":
+            append_content = corrupt_append(append_content)
+            result = "partial_success"
+            warnings = ["whiteboard conversion failed and one heading was dropped"]
+        else:
+            result = "success"
+            warnings = []
+        try:
+            state["content"] = append_to_document(state["content"], append_content)
+        except (ET.ParseError, ValueError):
+            state["call_counts"]["rejected"] += 1
+            save_state(state_path, state)
+            return error("invalid_xml", "append content must be a well-formed XML fragment")
+        state["revision_id"] = str(int(state["revision_id"]) + 1)
+        save_state(state_path, state)
+        return emit(
+            {
+                "ok": True,
+                "data": {
+                    "result": result,
+                    "revision_id": state["revision_id"],
+                    "warnings": warnings,
+                },
+            }
+        )
+
+    state["call_counts"]["rejected"] += 1
+    save_state(state_path, state)
+    return error("unsupported_command", "unsupported lark-cli command")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
